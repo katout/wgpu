@@ -1205,6 +1205,14 @@ pub trait Device: WasmNotSendSync {
     );
     fn tlas_instance_to_bytes(&self, instance: TlasInstance) -> Vec<u8>;
 
+    /// Appends the backend representation of `instance` to `out`.
+    ///
+    /// Same bytes as [`Device::tlas_instance_to_bytes`], without allocating a
+    /// `Vec` per instance. The default forwards to `tlas_instance_to_bytes`.
+    fn extend_tlas_instance_bytes(&self, instance: TlasInstance, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.tlas_instance_to_bytes(instance));
+    }
+
     fn get_internal_counters(&self) -> wgt::HalCounters;
 
     fn generate_allocator_report(&self) -> Option<wgt::AllocatorReport> {

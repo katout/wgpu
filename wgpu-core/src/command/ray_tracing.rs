@@ -24,9 +24,10 @@ use crate::{
         ArcTlasInstance, ArcTlasPackage, BlasBuildEntry, BlasGeometries,
         BuildAccelerationStructureError, OwnedBlasBuildEntry, OwnedTlasPackage, TlasPackage,
     },
-    resource::{Blas, BlasCompactState, Labeled, StagingBuffer, Tlas},
+    resource::{Blas, BlasCompactState, Labeled, StagingBuffer, Tlas, Trackable},
     scratch::ScratchBuffer,
     snatch::SnatchGuard,
+    FastHashMap, FastHashSet,
 };
 use crate::{lock::RwLockWriteGuard, resource::RawResourceAccess};
 
@@ -160,6 +161,9 @@ impl Global {
                 })
                 .collect::<Result<_, BuildAccelerationStructureError>>()?;
 
+            // A TLAS usually references few distinct BLASes from many instances.
+            // Resolve each distinct id once instead of taking the registry lock per instance.
+            let mut resolved_blas = FastHashMap::<BlasId, Arc<Blas>>::default();
             let tlas = tlas_iter
                 .map(|tlas_package| {
                     let instances = tlas_package
@@ -168,8 +172,16 @@ impl Global {
                             instance
                                 .as_ref()
                                 .map(|instance| {
+                                    let blas = match resolved_blas.get(&instance.blas_id) {
+                                        Some(blas) => blas.clone(),
+                                        None => {
+                                            let blas = self.resolve_blas_id(instance.blas_id)?;
+                                            resolved_blas.insert(instance.blas_id, blas.clone());
+                                            blas
+                                        }
+                                    };
                                     Ok(ArcTlasInstance {
-                                        blas: self.resolve_blas_id(instance.blas_id)?,
+                                        blas,
                                         transform: *instance.transform,
                                         custom_data: instance.custom_data,
                                         mask: instance.mask,
@@ -229,7 +241,10 @@ pub(crate) fn build_acceleration_structures(
 
         let first_byte_index = instance_buffer_staging_source.len();
 
+        // Distinct BLASes this TLAS depends on. Many instances usually share a few BLASes;
+        // tracking, submit-time validation and `Tlas::dependencies` only need each BLAS once.
         let mut dependencies = Vec::new();
+        let mut dependency_indices = FastHashSet::default();
 
         let mut instance_count = 0;
         for instance in package.instances.iter().flatten() {
@@ -239,9 +254,12 @@ pub(crate) fn build_acceleration_structures(
                 ));
             }
             let blas = &instance.blas;
-            state.tracker.blas_s.insert_single(blas.clone());
+            let first_use = dependency_indices.insert(blas.tracker_index());
+            if first_use {
+                state.tracker.blas_s.insert_single(blas.clone());
+            }
 
-            instance_buffer_staging_source.extend(state.device.raw().tlas_instance_to_bytes(
+            state.device.raw().extend_tlas_instance_bytes(
                 hal::TlasInstance {
                     transform: instance.transform,
                     custom_data: instance.custom_data,
@@ -249,7 +267,8 @@ pub(crate) fn build_acceleration_structures(
                     blas_address: blas.handle,
                     pipeline_intersection_data_offset: 0,
                 },
-            ));
+                &mut instance_buffer_staging_source,
+            );
 
             if tlas
                 .flags
@@ -268,7 +287,9 @@ pub(crate) fn build_acceleration_structures(
 
             instance_count += 1;
 
-            dependencies.push(blas.clone());
+            if first_use {
+                dependencies.push(blas.clone());
+            }
         }
 
         build_command.tlas_s_built.push(TlasBuild {
