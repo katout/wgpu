@@ -24,7 +24,7 @@ use crate::{
         ArcTlasInstance, ArcTlasPackage, BlasBuildEntry, BlasGeometries,
         BuildAccelerationStructureError, OwnedBlasBuildEntry, OwnedTlasPackage, TlasPackage,
     },
-    resource::{Blas, BlasCompactState, Labeled, StagingBuffer, Tlas, Trackable},
+    resource::{Blas, BlasCompactState, Labeled, StagingBuffer, Tlas},
     scratch::ScratchBuffer,
     snatch::SnatchGuard,
     FastHashMap, FastHashSet,
@@ -243,8 +243,10 @@ pub(crate) fn build_acceleration_structures(
 
         // Distinct BLASes this TLAS depends on. Many instances usually share a few BLASes;
         // tracking, submit-time validation and `Tlas::dependencies` only need each BLAS once.
+        // Keyed by the `Arc` pointer rather than `tracker_index`, which is only unique per device:
+        // every distinct BLAS object is still tracked and kept alive, as before.
         let mut dependencies = Vec::new();
-        let mut dependency_indices = FastHashSet::default();
+        let mut dependency_ptrs = FastHashSet::<*const Blas>::default();
 
         let mut instance_count = 0;
         for instance in package.instances.iter().flatten() {
@@ -254,7 +256,7 @@ pub(crate) fn build_acceleration_structures(
                 ));
             }
             let blas = &instance.blas;
-            let first_use = dependency_indices.insert(blas.tracker_index());
+            let first_use = dependency_ptrs.insert(Arc::as_ptr(blas));
             if first_use {
                 state.tracker.blas_s.insert_single(blas.clone());
             }
